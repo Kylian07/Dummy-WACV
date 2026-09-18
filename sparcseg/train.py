@@ -172,8 +172,10 @@ def train_model(
         w_monotone=getattr(cfg, "w_step_monotone", 0.05),
         w_recon=getattr(cfg, "w_code_recon", 0.10),
         deep_supervision=cfg.deep_supervision,
+        w_align=getattr(cfg, "w_energy_align", 0.0),
     )
     dictionary = getattr(model, "dictionary", None)
+    energy_fn = getattr(model, "energy", None)
 
     # Evidence curriculum (SPARC-Seg and the dense control alike, so the two
     # stay comparable). lambda_evidence anneals from lambda_evidence_start down
@@ -209,7 +211,8 @@ def train_model(
             optimizer.zero_grad(set_to_none=True)
             with autocast():
                 out = model(x, **fwd)
-                parts = criterion(out, y, pos_weight=pos_weight, dictionary=dictionary)
+                parts = criterion(out, y, pos_weight=pos_weight, dictionary=dictionary,
+                                  energy=energy_fn)
                 loss = parts["total"] + _extra_loss(model, x, y)
 
             scaler.scale(loss).backward()

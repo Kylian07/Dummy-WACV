@@ -217,6 +217,84 @@ particular needs ≈30 epochs before Dice approaches the 0.87–0.91 published b
 
 ---
 
+### 1.9 New: the first converged run fails on the **energy/accuracy coupling**, not on training
+
+The first full ISIC run (20 epochs, fold 0, seed 0, all five methods, ~95 min on
+a T4) trains properly and still fails the gate — on a different check, and for a
+different reason than §1.8.
+
+| readiness check | result |
+|---|---|
+| monotone descent (the Proposition) | **PASS**, rate 1.000 |
+| code explains the sketch | **PASS**, 0.346 |
+| energy descent tracks accuracy | **FAIL**, ρ = −0.093 |
+| reasoning loop helps | PASS by 4×10⁻⁵ (Dice 0.8888 at *K*=1 → 0.8878 at *K*=4) |
+| Dice in the published range | PASS, 0.8878 vs 0.87–0.91 |
+
+T1 is a null: SPARC-Seg 0.8878 against single-shot 0.8888, dense 0.8912,
+PTEA-lite 0.8885, none significant under Holm-corrected paired Wilcoxon. Only
+the textual bottleneck separates (0.6982, p ≈ 3e−76). So the paper rests on the
+causal claim, and the causal claim is gated off by one number.
+
+**The diagnosis is the functional, not the budget.** Three facts point the same
+way, and none of them is fixed by training longer:
+
+1. *E* has three terms and two of them — reconstruction ‖*S*−*Dz*‖² and evidence
+   ‖*S*−*g*(*x*)‖² — never reference the mask. They are anchors. Setting
+   ∇ₛ*E* = 0 gives *S** = (*Dz* + 2λₑ*g* − λₜₒₚₒ∇*R*)/(1 + 2λₑ): the fixed point
+   is a fixed function of the evidence and the dictionary. Descent cannot add
+   information the encoder did not already produce.
+2. The one term that does reach the mask, *R*(*S*), is a **smoothness** prior
+   (Huber-TV + curvature of the decoded map). On irregular lesion boundaries it
+   pulls the wrong way. T3 shows the signature: from *K*=1 to *K*=4, Dice falls
+   0.12% while BF@2 falls **3.3%** — a 27× larger relative hit on the boundary
+   metric than on the area metric, at 8% more compute per image.
+3. `w_step_monotone` does not cover this. It forbids per-step regressions, which
+   a step that does nothing satisfies — and a large energy drop with ≈0 Dice
+   change is exactly that.
+
+**Fix 1 — the statistic can now show its own power.** The gated ρ was measured
+over transitions *S*₁→…→*S*ₖ with hard-thresholded Dice, which understates the
+coupling for two reasons independent of the method: there is no readout at
+*S*₀, so the evidence→first-revision step is excluded — and on this run that
+step carried **64% of the entire energy drop** — and late-step ΔDice ties at
+exactly 0.0 for a large share of images. `energy_error_coupling` now reports the
+gated number unchanged (so runs stay comparable) beside a soft-Dice variant, a
+with-*S*₀ variant, a per-image level correlation over all *K*+1 states, the tie
+fraction, the first-step energy share, and a **per-term** breakdown of which
+part of *E* pulls against accuracy. `print_report` renders this as a COUPLING
+panel, and the readiness gate now prints a per-check diagnosis instead of one
+blanket paragraph — which on this run misattributed the failure to dictionary
+undertraining while the dictionary check was passing.
+
+**Fix 2 — `w_energy_align`, off by default.** Because descent is monotone by
+construction, Δ*E* ≤ 0 always: its sign carries no information and a
+sign-agreement loss degenerates into `step_monotonicity_penalty`. What the
+diagnostic measures is a rank correlation between the *magnitude* of the drop
+and the *magnitude* of the quality gain, so the training signal has to be a
+ranking one — a differentiable Kendall-τ surrogate penalising discordant
+(image, step) pairs. Directional check on a 120-iteration synthetic task:
+
+| `w_energy_align` | Dice | ρ (gated) | ρ (soft) |
+|---|---|---|---|
+| 0.0 | 0.9650 | −0.008 | +0.400 |
+| 0.1 | 0.9157 | −0.025 | +0.555 |
+| 0.5 | 0.9281 | +0.070 | +0.664 |
+
+It moves the targeted statistic and costs accuracy, so it ships **off** and
+enters the table as the `energy_align_on` ablation, alongside the existing
+`no_topo` and `no_evidence_term` rows that isolate items 1 and 2 above.
+
+**What this does not fix.** Even ungated, T2 on this run is a null:
+necessity AUC 0.0015 against a random-null AUC of 0.0015, sufficiency 1.017,
+CSI gap +0.0009 (p = 0.035, effect 0.14), and 124 of 192 atoms dead. With
+`code_explained_variance` at 0.346, 65% of the sketch bypasses the concept
+bottleneck, so the readout is largely decoding the evidence path. Aligning the
+energy is necessary for the causal table to be readable; it is not sufficient
+for the causal claim to be true.
+
+---
+
 ## 2. The problem the workshop is posing
 
 The LVR CFP is unusually specific:

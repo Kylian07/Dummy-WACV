@@ -15,6 +15,16 @@ Beyond the usual BCE + soft-Dice, two auxiliaries matter for this paper:
     guarantees the *mask* improves. Penalising per-step Dice regressions makes
     the two coincide in practice and gives the paper its honest answer to
     "so what if E decreases?".
+
+``energy_alignment``  The stronger version of the same worry, and the one the
+    measured failure calls for. Monotonicity only asks that the mask never gets
+    worse; it is satisfied -- vacuously -- by a loop whose steps do nothing,
+    which is what a per-step Dice change of ~0 with a large energy drop looks
+    like. Alignment asks that a *bigger* energy drop buy a *bigger* quality
+    gain, which is exactly the rank correlation ``energy_error_coupling``
+    reports and the readiness gate tests. OFF BY DEFAULT (w_energy_align = 0.0):
+    it changes the trained model, so it belongs in an ablation until it is shown
+    to earn its place.
 """
 
 from __future__ import annotations
@@ -32,6 +42,18 @@ def soft_dice_loss(logits: torch.Tensor, target: torch.Tensor,
     num = 2.0 * (p * target).flatten(1).sum(1) + eps
     den = p.flatten(1).sum(1) + target.flatten(1).sum(1) + eps
     return (1.0 - num / den).mean()
+
+
+def soft_dice_per_sample(logits: torch.Tensor, target: torch.Tensor,
+                         eps: float = 1.0) -> torch.Tensor:
+    """Soft Dice kept per image, (B,).  ``soft_dice_loss`` reduces over the
+    batch, which is right for a loss and wrong for anything that needs to rank
+    images or steps against each other."""
+    p = torch.sigmoid(logits).flatten(1)
+    t = target.flatten(1)
+    num = 2.0 * (p * t).sum(1) + eps
+    den = p.sum(1) + t.sum(1) + eps
+    return num / den
 
 
 def bce_loss(logits: torch.Tensor, target: torch.Tensor,
@@ -123,21 +145,73 @@ def step_monotonicity_penalty(logits_per_step: Sequence[torch.Tensor],
     return pen / (len(logits_per_step) - 1)
 
 
+def energy_alignment_penalty(energies: Sequence[torch.Tensor],
+                             logits_per_step: Sequence[torch.Tensor],
+                             target: torch.Tensor,
+                             eps: float = 1e-8) -> torch.Tensor:
+    """Push the *size* of each energy drop to rank with the size of the quality
+    gain it buys.
+
+    Why not simply penalise sign disagreement
+    -----------------------------------------
+    The descent is monotone by construction, so dE <= 0 on every step of every
+    trajectory: the sign of dE carries no information and a sign-agreement
+    penalty degenerates into ``step_monotonicity_penalty``, which this file
+    already has.  What the energy-vs-accuracy diagnostic actually measures is a
+    rank correlation between the *magnitude* of the drop and the *magnitude* of
+    the Dice change, so the training signal has to be a ranking one too.
+
+    This is a differentiable Kendall-tau surrogate: over every pair of (image,
+    step) observations in the batch, penalise the discordant ones -- the pairs
+    where the step that dropped the energy further is the step that improved the
+    mask less.  Both axes are standardised by their own (detached) spread, so
+    the term is scale-free and does not compete with the segmentation loss for
+    control of the energy's overall magnitude.
+
+    ``energies[t]`` must be the energy at the state that ``logits_per_step[t]``
+    decodes, i.e. both indexed by S_1 .. S_K.
+    """
+    K = min(len(energies), len(logits_per_step))
+    if K < 2:
+        return logits_per_step[0].new_zeros(()) if logits_per_step else torch.zeros(())
+
+    q = torch.stack([soft_dice_per_sample(logits_per_step[t], target)
+                     for t in range(K)])                       # (K, B)
+    e = torch.stack(list(energies[:K]))                        # (K, B)
+    scale = e[0].detach().abs() + eps                          # per-image
+    u = (e[:-1] - e[1:]) / scale                               # drop, >= 0
+    v = q[1:] - q[:-1]                                         # quality gain
+    u, v = u.flatten(), v.flatten()
+    if u.numel() < 3:
+        return u.new_zeros(())
+
+    u = u / (u.detach().std() + eps)
+    v = v / (v.detach().std() + eps)
+    du = u[:, None] - u[None, :]
+    dv = v[:, None] - v[None, :]
+    disc = F.relu(-(du * dv))
+    n = u.numel()
+    # Off-diagonal mean; the diagonal is identically zero.
+    return disc.sum() / max(n * (n - 1), 1)
+
+
 class SPARCSegLoss(nn.Module):
     def __init__(self, alpha: float = 0.5, deep_decay: float = 0.5,
                  w_usage: float = 0.01, w_monotone: float = 0.05,
-                 w_recon: float = 0.10, deep_supervision: bool = True) -> None:
+                 w_recon: float = 0.10, deep_supervision: bool = True,
+                 w_align: float = 0.0) -> None:
         super().__init__()
         self.alpha = alpha
         self.deep_decay = deep_decay
         self.w_usage = w_usage
         self.w_monotone = w_monotone
         self.w_recon = w_recon
+        self.w_align = w_align
         self.deep_supervision = deep_supervision
 
     def forward(self, out, target: torch.Tensor,
                 pos_weight: Optional[torch.Tensor] = None,
-                dictionary=None) -> Dict[str, torch.Tensor]:
+                dictionary=None, energy=None) -> Dict[str, torch.Tensor]:
         steps = out.logits_per_step or [out.logits]
         if self.deep_supervision and len(steps) > 1:
             main = deep_supervision_loss(steps, target, self.alpha, self.deep_decay, pos_weight)
@@ -161,6 +235,16 @@ class SPARCSegLoss(nn.Module):
             mono = step_monotonicity_penalty(steps, target)
             parts["monotone"] = mono
             total = total + self.w_monotone * mono
+
+        if (self.w_align > 0 and energy is not None and out.codes
+                and out.evidence is not None and len(out.logits_per_step) > 1):
+            # Recomputed with grad: ``out.energy`` is a detached CPU trace kept
+            # for reporting, so it cannot carry a training signal.
+            e_states = [energy.total(z, out.sketches[t + 1], out.evidence)
+                        for t, z in enumerate(out.codes)]
+            align = energy_alignment_penalty(e_states, out.logits_per_step, target)
+            parts["energy_align"] = align
+            total = total + self.w_align * align
 
         parts["total"] = total
         return parts

@@ -647,6 +647,25 @@ def bottleneck_diagnostics(model: SPARCSeg, loader, device: torch.device,
 # --------------------------------------------------------------------------
 # Does the energy actually track the answer?
 # --------------------------------------------------------------------------
+def _soft_dice_rows(logits: torch.Tensor, y: torch.Tensor) -> np.ndarray:
+    """Per-image soft Dice of sigmoid(logits) against a binary target.
+
+    The hard-thresholded Dice used for the headline numbers is the right metric
+    for a results table and the wrong one for a *correlation*: late reasoning
+    steps move a handful of pixels, most of which do not cross 0.5, so the
+    per-step delta is exactly 0.0 for a large fraction of images and Spearman
+    spends its rank budget on ties.  The soft version is strictly monotone in
+    the same quantity and has no ties, so it can see a coupling that the hard
+    version cannot resolve.  Both are reported; they answer the same question
+    with different power.
+    """
+    p = torch.sigmoid(logits).flatten(1)
+    t = y.flatten(1)
+    num = 2.0 * (p * t).sum(1)
+    den = p.sum(1) + t.sum(1)
+    return (num / den.clamp_min(1e-8)).detach().cpu().numpy()
+
+
 @torch.no_grad()
 def energy_error_coupling(model, loader, device: torch.device,
                           cfg: CausalConfig) -> Dict[str, float]:
@@ -657,40 +676,152 @@ def energy_error_coupling(model, loader, device: torch.device,
     the two are uncorrelated, the convergence guarantee is decorative -- exactly
     the charge the workshop levels at latent reasoning in general -- so the paper
     is better off measuring it than asserting it.
+
+    Reading the panel this returns
+    ------------------------------
+    ``energy_gain_alignment`` is the primary, gated number and is computed
+    exactly as it always was -- hard Dice, transitions S_1 -> ... -> S_K -- so
+    it stays comparable with earlier runs.  Three things make that statistic
+    weaker than it looks, and each now has its own entry beside it:
+
+    * **The largest transition is missing.**  ``logits_per_step`` is filled
+      inside the unrolled loop, so there is no readout at S_0 and the evidence
+      -> first-revision step is silently excluded.  On the ISIC run that step
+      carried 64% of the whole energy drop, leaving the statistic to correlate
+      the flat tail of the trajectory.  ``*_with_step0`` adds it back by
+      decoding S_0 through the same readout.
+    * **Ties.**  See ``_soft_dice_rows``; ``dice_delta_tie_fraction`` reports
+      how much of the sample was ties, and the ``*_soft`` variants remove them.
+    * **The total energy is mostly mask-irrelevant.**  Two of E's three terms
+      (reconstruction, evidence) are anchors that do not reference the mask at
+      all; only the shape prior reaches it, through the shared readout.
+      ``alignment_by_term`` breaks the correlation out per term, which is what
+      distinguishes "the loop is undertrained" from "the functional is not
+      shaped like accuracy".
+
+    ``level_alignment`` is the better-powered form of the same question: within
+    one image, do the states with lower energy have higher Dice?  It uses all
+    K+1 states rather than K-1 deltas and is not affected by the exclusion
+    above.
     """
     from .stats import spearman
 
     model.eval()
     d_e: List[float] = []
     d_dice: List[float] = []
+    d_dice_soft: List[float] = []
+    d_e0: List[float] = []          # same, with the S_0 -> S_1 step included
+    d_dice0: List[float] = []
+    d_dice0_soft: List[float] = []
+    d_terms: Dict[str, List[float]] = {}
+    level_rhos: List[float] = []
+    first_step_share: List[float] = []
     mono: List[float] = []
     seen = 0
+
+    has_readout = hasattr(model, "readout")
+    has_energy_fn = hasattr(model, "energy") and hasattr(model.energy, "breakdown")
 
     for batch in loader:
         if seen >= cfg.max_images:
             break
         x = batch["image"].to(device)
+        y_t = (batch["mask"].to(device) > 0.5).float()
         y = batch["mask"].squeeze(1).numpy() > 0.5
         out = model(x, n_steps=model.n_steps)
         if out.energy is None or len(out.logits_per_step) < 2:
             break
         E = out.energy.stack().numpy()                       # (K+1, B)
-        dices = np.stack([batch_dice(binarize(lg, cfg.threshold), y)
-                          for lg in out.logits_per_step])     # (K, B)
+        steps = list(out.logits_per_step)                     # S_1 .. S_K
+        if has_readout and out.sketches:
+            # Decode S_0 with the same head, so the evidence -> first-revision
+            # transition enters the statistic on identical terms.
+            steps = [model.readout(out.sketches[0], x.shape[-2:])] + steps
+        dices_all = np.stack([batch_dice(binarize(lg, cfg.threshold), y)
+                              for lg in steps])               # (K+1 or K, B)
+        soft_all = np.stack([_soft_dice_rows(lg, y_t) for lg in steps])
+        # Row alignment.  ``base`` is 1 when S_0 was decoded (so row 0 is S_0
+        # and row base+j-1 is S_j); ``eoff`` maps a decoded row back onto its
+        # row in the energy trace, which always starts at S_0.
+        base = dices_all.shape[0] - len(out.logits_per_step)
+        eoff = 1 - base
+
+        # Per-term energies for states 1..K (z_0 is not returned, so the
+        # breakdown cannot be formed at S_0 -- hence the primary window).
+        terms_per_state: List[Dict[str, np.ndarray]] = []
+        if has_energy_fn and out.codes and out.evidence is not None:
+            for t, z_t in enumerate(out.codes):
+                bd = model.energy.breakdown(z_t, out.sketches[t + 1], out.evidence)
+                terms_per_state.append({k: v.detach().cpu().numpy()
+                                        for k, v in bd.items() if k != "total"})
+
         for b in range(x.shape[0]):
-            for t in range(dices.shape[0] - 1):
+            # Primary window: transitions between S_1 .. S_K only.
+            for t in range(len(out.logits_per_step) - 1):
                 d_e.append(float(E[t + 2, b] - E[t + 1, b]))
-                d_dice.append(float(dices[t + 1, b] - dices[t, b]))
+                d_dice.append(float(dices_all[base + t + 1, b] - dices_all[base + t, b]))
+                d_dice_soft.append(float(soft_all[base + t + 1, b] - soft_all[base + t, b]))
+                for k in (terms_per_state[t + 1] if t + 1 < len(terms_per_state) else {}):
+                    d_terms.setdefault(k, []).append(
+                        float(terms_per_state[t + 1][k][b] - terms_per_state[t][k][b]))
+            # Full window: every transition the trajectory actually took.
+            for t in range(dices_all.shape[0] - 1):
+                d_e0.append(float(E[t + 1 + eoff, b] - E[t + eoff, b]))
+                d_dice0.append(float(dices_all[t + 1, b] - dices_all[t, b]))
+                d_dice0_soft.append(float(soft_all[t + 1, b] - soft_all[t, b]))
+            # Level form: across the states of one image, does lower E mean
+            # higher Dice?  Uses every state, so the excluded-step problem and
+            # the tie problem both go away.
+            lv = spearman(-E[eoff:eoff + dices_all.shape[0], b], soft_all[:, b])
+            if np.isfinite(lv["rho"]):
+                level_rhos.append(lv["rho"])
+            drop = E[0, b] - E[-1, b]
+            if abs(drop) > 1e-8:
+                first_step_share.append(float((E[0, b] - E[1, b]) / drop))
+
         mono.extend(out.energy.is_monotone().float().tolist())
         seen += x.shape[0]
 
+    def _rho(de: List[float], dd: List[float]) -> Dict[str, float]:
+        if not de:
+            return {"rho": float("nan"), "p": float("nan"), "n": 0}
+        return spearman(-np.array(de), np.array(dd))
+
     # Reported as descent-vs-improvement so the sign reads the intuitive way:
     # POSITIVE means "steps that lower the energy more also improve Dice more".
-    sp = spearman(-np.array(d_e), np.array(d_dice))
+    sp = _rho(d_e, d_dice)
+    sp_soft = _rho(d_e, d_dice_soft)
+    sp0 = _rho(d_e0, d_dice0)
+    sp0_soft = _rho(d_e0, d_dice0_soft)
+
+    by_term: Dict[str, float] = {}
+    for k, v in d_terms.items():
+        if len(v) != len(d_dice_soft):
+            continue
+        r = _rho(v, d_dice_soft)["rho"]
+        # A term that is constant along the trajectory (the sparsity indicator
+        # in top-k mode is identically zero) has no rank to correlate; leaving
+        # its NaN in would let it win the "pulls hardest" comparison below.
+        if np.isfinite(r):
+            by_term[k] = r
+
+    ties = (float(np.mean(np.asarray(d_dice) == 0.0)) if d_dice else float("nan"))
     return {
         "energy_gain_alignment": sp["rho"],
         "spearman_dE_dDice": -sp["rho"] if np.isfinite(sp["rho"]) else float("nan"),
         "p": sp["p"],
         "n": float(sp["n"]),
         "monotone_descent_rate": float(np.mean(mono)) if mono else float("nan"),
+        # -- power and coverage of the statistic above -----------------------
+        "energy_gain_alignment_soft": sp_soft["rho"],
+        "energy_gain_alignment_with_step0": sp0["rho"],
+        "energy_gain_alignment_soft_with_step0": sp0_soft["rho"],
+        "p_soft_with_step0": sp0_soft["p"],
+        "n_with_step0": float(sp0["n"]),
+        "dice_delta_tie_fraction": ties,
+        "first_step_energy_share": (float(np.mean(first_step_share))
+                                    if first_step_share else float("nan")),
+        "level_alignment": (float(np.mean(level_rhos)) if level_rhos else float("nan")),
+        "level_alignment_n": float(len(level_rhos)),
+        "alignment_by_term": by_term,
     }

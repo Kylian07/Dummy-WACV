@@ -133,6 +133,24 @@ class CoreConfig:
     w_code_recon: float = 0.0
     w_usage_balance: float = 0.01   # keeps the dictionary populated
     w_step_monotone: float = 0.05   # penalises per-step Dice regressions
+    # Rank-alignment between the size of each energy drop and the size of the
+    # quality gain it buys. This is the direct training counterpart of the
+    # ``energy descent tracks accuracy`` readiness check, added because that
+    # check is the one that failed on the first full ISIC run:
+    #
+    #   rho = -0.093 (hard Dice, steps 1..K)   <- the gated number
+    #
+    # with a monotone-descent rate of 1.000 and Dice within the published
+    # range. Nothing in the objective had ever asked the two to agree: E's
+    # reconstruction and evidence terms do not reference the mask at all, and
+    # its one mask-aware term is a smoothness prior, which on irregular lesion
+    # boundaries pulls the *wrong* way (ISIC K=1 -> K=4: Dice -0.12%, but
+    # BF@2 -3.3%). ``w_step_monotone`` does not cover this: it only forbids
+    # regressions, and is satisfied by steps that do nothing.
+    #
+    # DEFAULT 0.0. It changes the trained model, so it ships as an ablation
+    # (``energy_align_on``) rather than as a silent change to the main table.
+    w_energy_align: float = 0.0
 
     # -- protocol -----------------------------------------------------------
     n_folds: int = 5

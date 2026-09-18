@@ -272,6 +272,9 @@ def run_ablations(dataset_key: str, samples, cfg: CoreConfig, plan: ExperimentPl
     one("no_code_recon_loss", cfg.replace(w_code_recon=0.0))
     one("evidence_curriculum_on", cfg.replace(evidence_warmup_frac=0.3))
     one("no_topo (lambda2=0)", cfg.replace(lambda_topo=0.0))
+    # The direct test of the energy/accuracy decoupling: does asking the size of
+    # each energy drop to rank with the size of the quality gain cost accuracy?
+    one("energy_align_on", cfg.replace(w_energy_align=0.1))
     one("no_evidence_term (lambda3=0)", cfg.replace(lambda_evidence=0.0))
     # Sparsity-mechanism ablations, matched to whichever mode is in use.
     if cfg.sparsity_mode == "topk":
@@ -499,6 +502,117 @@ def readiness_report(results: Dict[str, object]) -> Dict[str, object]:
             "n_hard_failures": len(hard_fail)}
 
 
+# Per-check diagnosis for a failed gate.  A single blanket paragraph was worse
+# than useless here: the first full ISIC run failed on the energy/accuracy
+# coupling with the dictionary check PASSING, and the blanket text blamed
+# dictionary undertraining -- a misdiagnosis that would send the next run to
+# train longer when the functional itself is what needs changing.
+WHY_FAILED: Dict[str, str] = {
+    "code explains the sketch": (
+        "     The readout is decoding something the code did not build, so no\n"
+        "     ablation of z can matter and the state is decorative BY\n"
+        "     CONSTRUCTION. On an undertrained dictionary the causal metrics\n"
+        "     track DICTIONARY QUALITY, not state structure: when the dictionary\n"
+        "     compresses worse than the raw evidence does, ablating code content\n"
+        "     pushes S back toward g(x) and IMPROVES the mask, so necessity and\n"
+        "     CSI go negative for a reason that has nothing to do with sparsity.\n"
+        "     Train to convergence, or raise w_code_recon, then re-read."),
+    "monotone descent (the Proposition)": (
+        "     The energy INCREASED on some trajectory. This is a bug, not a\n"
+        "     tuning problem -- the Proposition is false as run. Check the\n"
+        "     S-step size and turn on backtracking_eval before anything else."),
+    "energy descent tracks accuracy": (
+        "     Descent is real (see the monotone-descent rate) but it does not\n"
+        "     buy accuracy: the steps that lower E the most are not the steps\n"
+        "     that improve the mask the most. This is NOT the undertraining\n"
+        "     failure above -- check whether 'code explains the sketch' passed.\n"
+        "     If it did, the functional is the problem, not the budget:\n"
+        "       - two of E's three terms (reconstruction, evidence) never\n"
+        "         reference the mask, so they cannot track it;\n"
+        "       - the one that does, the shape prior, is a SMOOTHNESS penalty,\n"
+        "         which erodes irregular boundaries -- compare how much BF@2\n"
+        "         falls against how much Dice falls in T3;\n"
+        "       - w_step_monotone only forbids regressions, so it is satisfied\n"
+        "         by steps that do nothing, which is what a large energy drop\n"
+        "         with ~zero Dice change looks like.\n"
+        "     Read the COUPLING panel below before acting: it separates a weak\n"
+        "     statistic (ties, an excluded first step) from a weak functional,\n"
+        "     and names which energy term is pulling the wrong way. The ablation\n"
+        "     for the functional is w_energy_align > 0; the ablations for the\n"
+        "     terms are 'no_topo' and 'no_evidence_term'."),
+    "reasoning loop helps": (
+        "     Dice falls as K rises: the loop is a liability at this budget.\n"
+        "     Almost always undertraining of the dictionary -- the sketch is\n"
+        "     routed through a D that cannot yet reconstruct it. Check\n"
+        "     code_explained_variance, train longer, and if it persists set\n"
+        "     evidence_warmup_frac = 0.3 so the loop takes authority only as\n"
+        "     the dictionary becomes competent."),
+    "no method collapsed to empty masks": (
+        "     A method predicts nothing on every image. Its scores are the\n"
+        "     empty-mask floor, not a measurement. Check pos_weight and the\n"
+        "     learning rate before reading any row it appears in."),
+}
+
+
+def print_energy_coupling(block: Dict[str, object]) -> None:
+    """The panel that separates a weak statistic from a weak functional.
+
+    The gated number is a Spearman over per-step deltas, and three things can
+    hold it near zero for reasons that have nothing to do with the method:
+    the transition that carries most of the descent is excluded (there is no
+    readout at S_0), thresholded Dice ties on the flat tail of the trajectory,
+    and the total energy is dominated by terms that never touch the mask.  Each
+    of those now has a column here, so "the loop does not track accuracy" and
+    "this statistic cannot see whether it does" are distinguishable.
+    """
+    def _f(v, fmt="{:+.3f}"):
+        try:
+            return fmt.format(float(v)) if v is not None and np.isfinite(float(v)) else "n/a"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    have = [m for m in ("sparcseg", "dense_unrolled")
+            if (block.get(m) or {}).get("energy_coupling")]
+    if not have:
+        return
+    print("\n   COUPLING -- is the energy shaped like accuracy, or is the "
+          "statistic just weak?\n")
+    rows = []
+    for m in have:
+        ec = block[m]["energy_coupling"]
+        rows.append({
+            "label": METHOD_LABELS.get(m, m),
+            "gated": _f(ec.get("energy_gain_alignment")),
+            "soft": _f(ec.get("energy_gain_alignment_soft")),
+            "s0": _f(ec.get("energy_gain_alignment_with_step0")),
+            "s0soft": _f(ec.get("energy_gain_alignment_soft_with_step0")),
+            "level": _f(ec.get("level_alignment")),
+            "ties": _f(ec.get("dice_delta_tie_fraction"), "{:.2f}"),
+            "share": _f(ec.get("first_step_energy_share"), "{:.2f}"),
+        })
+    print(markdown_table(rows, [
+        ("label", "Method"), ("gated", "rho (gated)"), ("soft", "rho soft"),
+        ("s0", "rho +step0"), ("s0soft", "rho soft+step0"),
+        ("level", "rho level"), ("ties", "dDice ties"),
+        ("share", "E drop in step 1"),
+    ]))
+    print("   rho (gated) = hard Dice over steps 1..K, the number the readiness "
+          "gate tests.")
+    print("   'dDice ties' is the fraction of those deltas that are exactly "
+          "0.0 -- rank budget\n   spent on ties, i.e. how much power the gated "
+          "statistic does not have.")
+    print("   'E drop in step 1' is the share of the whole descent that happens "
+          "before the\n   gated window opens. High means the gated number is "
+          "reading the flat tail.")
+    for m in have:
+        bt = block[m]["energy_coupling"].get("alignment_by_term") or {}
+        if bt:
+            worst = min(bt, key=lambda k: bt[k])
+            print(f"   [{m}] per-term rho: "
+                  + ", ".join(f"{k} {bt[k]:+.3f}" for k in sorted(bt))
+                  + f"   <- '{worst}' pulls hardest against accuracy")
+
+
 def print_readiness(results: Dict[str, object]) -> bool:
     r = readiness_report(results)
     banner("READINESS -- can these causal numbers be read?", char="=")
@@ -510,16 +624,14 @@ def print_readiness(results: Dict[str, object]) -> bool:
         print("\n  -> preconditions hold; the faithfulness table below is "
               "interpretable.")
     else:
-        print(
-            f"\n  -> {r['n_hard_failures']} HARD CHECK(S) FAILED. The faithfulness "
-            f"table below is NOT\n"
-            f"     interpretable. On an undertrained model the causal metrics track\n"
-            f"     DICTIONARY QUALITY, not state structure: when the dictionary\n"
-            f"     compresses worse than the raw evidence does, ablating code content\n"
-            f"     pushes S back toward g(x) and IMPROVES the mask, so necessity and\n"
-            f"     CSI go negative for a reason that has nothing to do with sparsity.\n"
-            f"     Train to convergence, then re-read this table."
-        )
+        print(f"\n  -> {r['n_hard_failures']} HARD CHECK(S) FAILED. The faithfulness "
+              f"table below is NOT interpretable.")
+        for c in r["checks"]:
+            if c["hard"] and not c["ok"]:
+                why = WHY_FAILED.get(c["check"])
+                if why:
+                    print(f"\n     [{c['check']}]")
+                    print(why)
     return r["causal_interpretable"]
 
 
@@ -634,6 +746,7 @@ def print_report(results: Dict[str, object]) -> None:
                       f"energy-gain alignment rho "
                       f"{ec.get('energy_gain_alignment', float('nan')):+.3f} "
                       f"(positive = energy drops track Dice gains)")
+        print_energy_coupling(block)
 
     eff = results.get("efficiency", {})
     if eff:
