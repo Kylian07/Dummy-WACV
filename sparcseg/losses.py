@@ -68,6 +68,35 @@ def deep_supervision_loss(
     return loss
 
 
+def code_reconstruction_loss(codes, sketches, dictionary, eps: float = 1e-8) -> torch.Tensor:
+    """Scale-free reconstruction error ||S_t - D z_t||^2 / ||S_t||^2, over steps.
+
+    Why this is needed, and was not obvious
+    ---------------------------------------
+    The energy's reconstruction term is minimised by the *inference procedure*
+    (the z-step solves for z given S). The dictionary PARAMETERS, however, were
+    only ever trained by a gradient backpropagated through K unrolled S-steps
+    from the segmentation loss -- diffuse and slow. Meanwhile the readout reads
+    S_K, which the S-step drags toward Dz from the very first iteration. So for
+    the first epochs the model routes its prediction through a nearly random
+    dictionary, and each additional reasoning step costs accuracy: the K-sweep
+    decreases monotonically and the loop looks like a liability.
+
+    Normalising by ||S||^2 matters: an unnormalised term would be minimisable by
+    shrinking S rather than by improving D.
+    """
+    if not codes or dictionary is None:
+        return torch.zeros((), device=sketches[0].device if sketches else None)
+    total = None
+    for t, z in enumerate(codes):
+        s_t = sketches[t + 1] if t + 1 < len(sketches) else sketches[-1]
+        resid = (s_t - dictionary.synthesize(z)).pow(2).flatten(1).sum(1)
+        denom = s_t.pow(2).flatten(1).sum(1).clamp_min(eps)
+        term = (resid / denom).mean()
+        total = term if total is None else total + term
+    return total / max(len(codes), 1)
+
+
 def atom_usage_balance(z: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Encourage activation mass to spread across atoms (lower = better spread).
 
@@ -97,16 +126,18 @@ def step_monotonicity_penalty(logits_per_step: Sequence[torch.Tensor],
 class SPARCSegLoss(nn.Module):
     def __init__(self, alpha: float = 0.5, deep_decay: float = 0.5,
                  w_usage: float = 0.01, w_monotone: float = 0.05,
-                 deep_supervision: bool = True) -> None:
+                 w_recon: float = 0.10, deep_supervision: bool = True) -> None:
         super().__init__()
         self.alpha = alpha
         self.deep_decay = deep_decay
         self.w_usage = w_usage
         self.w_monotone = w_monotone
+        self.w_recon = w_recon
         self.deep_supervision = deep_supervision
 
     def forward(self, out, target: torch.Tensor,
-                pos_weight: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                pos_weight: Optional[torch.Tensor] = None,
+                dictionary=None) -> Dict[str, torch.Tensor]:
         steps = out.logits_per_step or [out.logits]
         if self.deep_supervision and len(steps) > 1:
             main = deep_supervision_loss(steps, target, self.alpha, self.deep_decay, pos_weight)
@@ -115,6 +146,11 @@ class SPARCSegLoss(nn.Module):
 
         parts: Dict[str, torch.Tensor] = {"seg": main}
         total = main
+
+        if out.codes and dictionary is not None and self.w_recon > 0:
+            rec = code_reconstruction_loss(out.codes, out.sketches, dictionary)
+            parts["code_recon"] = rec
+            total = total + self.w_recon * rec
 
         if out.codes and self.w_usage > 0:
             usage = atom_usage_balance(out.codes[-1])

@@ -49,6 +49,22 @@ class CoreConfig:
     # decorative by construction. 0.25 keeps the code load-bearing while still
     # anchoring S to the image. ``code_explained_variance`` audits this.
     lambda_evidence: float = 0.25
+    # Evidence CURRICULUM. At the start of training the dictionary is random, so
+    # a loop that immediately routes the sketch through it destroys information:
+    # every reasoning step makes the prediction worse, and the K-sweep decreases
+    # monotonically. Starting with a high evidence weight keeps S ~ g(x) (the
+    # model behaves like the single-shot baseline, which trains fast) and hands
+    # authority to the code only as the dictionary becomes competent.
+    #
+    # OFF BY DEFAULT (evidence_warmup_frac = 0.0). It is the designed remedy for
+    # a monotonically decreasing K-sweep, but on every regime reproducible here
+    # the loop already helped, so there was no pathology for it to fix and it
+    # cost ~0.006 Dice. Shipping it on without evidence of benefit would be
+    # unjustified. TURN IT ON (evidence_warmup_frac = 0.3) if the efficiency
+    # table shows Dice falling as K rises -- train.py prints a warning naming
+    # exactly that symptom.
+    lambda_evidence_start: float = 2.0
+    evidence_warmup_frac: float = 0.0   # fraction of epochs spent annealing
     nonneg_code: bool = True        # z >= 0 -> atoms read as "concept present"
 
     # Step sizes.  The z-step uses the provably safe eta = 1/L with
@@ -90,6 +106,33 @@ class CoreConfig:
     grad_clip: float = 1.0
     warmup_epochs: int = 2
     dice_ce_alpha: float = 0.5      # loss = a * BCE + (1 - a) * soft-Dice
+    # Direct reconstruction pressure on D. The energy's recon term is minimised
+    # at INFERENCE time by the z-step; the dictionary parameters themselves only
+    # ever see a diffuse gradient backpropagated through K unrolled S-steps.
+    #
+    # DEFAULT 0.0, and the measurement is worth recording, because the obvious
+    # intuition ("a stronger bottleneck must make the code more causally
+    # necessary") is FALSE. Sweep at 6 epochs, synthetic dermoscopy-like data:
+    #
+    #   w      Dice     BF@2    code_expl_var    CSI       necessity_auc
+    #   0.00   0.8719   0.6289      0.440       -0.0029      -0.0053
+    #   0.02   0.8670   0.6094      0.617       -0.0046      -0.0098
+    #   0.05   0.8591   0.5754      0.750       -0.0087      -0.0178
+    #   0.10   0.8484   0.5123      0.799       -0.0148      -0.0289
+    #   0.25   0.8357   0.4524      0.868       -0.0132      -0.0352
+    #
+    # Forcing the code to explain more of the sketch buys exactly what it says
+    # on the tin and costs accuracy AND causal structure: necessity becomes more
+    # negative, i.e. ablating the top atoms *helps*. The reading is that when the
+    # dictionary compresses worse than the raw evidence does, removing code
+    # content moves S back toward g(x) and improves the mask. Under-trained
+    # dictionary quality, not state structure, is what these numbers track.
+    #
+    # Keep at 0.0 unless you specifically want the accuracy/bottleneck frontier
+    # as a figure -- which is a legitimate ablation, just not a default.
+    w_code_recon: float = 0.0
+    w_usage_balance: float = 0.01   # keeps the dictionary populated
+    w_step_monotone: float = 0.05   # penalises per-step Dice regressions
 
     # -- protocol -----------------------------------------------------------
     n_folds: int = 5
@@ -123,6 +166,10 @@ class DatasetConfig:
     modality: str
     physics: str
     in_channels: int = 3
+    # Dice range a competent ResNet-34 U-Net reaches on this dataset in the
+    # published literature. Used only by the readiness check, to tell "the
+    # method underperforms" apart from "this run is undertrained".
+    reference_dice: Tuple[float, float] = (0.0, 1.0)
     # Substrings used to locate the dataset under /kaggle/input without
     # hard-coding a Kaggle slug (slugs differ between mirrors of the same set).
     discovery_hints: Sequence[str] = field(default_factory=tuple)
@@ -133,6 +180,7 @@ class DatasetConfig:
 DATASETS: Dict[str, DatasetConfig] = {
     "busi": DatasetConfig(
         key="busi",
+        reference_dice=(0.78, 0.84),
         name="BUSI (Breast Ultrasound Images)",
         modality="Ultrasound",
         physics="acoustic",
@@ -146,6 +194,7 @@ DATASETS: Dict[str, DatasetConfig] = {
     ),
     "isic": DatasetConfig(
         key="isic",
+        reference_dice=(0.87, 0.91),
         name="ISIC 2018 Task 1 (Skin Lesion Segmentation)",
         modality="Dermoscopy",
         physics="optical",
@@ -158,6 +207,7 @@ DATASETS: Dict[str, DatasetConfig] = {
     ),
     "brisc": DatasetConfig(
         key="brisc",
+        reference_dice=(0.8, 0.88),
         name="BRISC 2025 (Brain Tumor MRI Segmentation)",
         modality="MRI",
         physics="magnetic",

@@ -149,7 +149,24 @@ Naive top-1 necessity is still reported, labelled confounded, for comparability.
 
 ## Reading the output
 
-In order of how badly each one invalidates the result:
+`print_report` runs a **readiness gate** first and refuses to present the
+faithfulness table when its hard checks fail. This is not politeness: on an
+undertrained model the causal metrics track *dictionary quality*, not state
+structure. When the dictionary compresses the sketch worse than the raw evidence
+does, ablating code content pushes `S` back toward `g(x)` and **improves** the
+mask — so necessity and CSI go negative, and "not trained yet" looks exactly
+like "sparse states are less causally necessary than dense ones".
+
+```
+READINESS -- can these causal numbers be read?
+  [PASS] monotone descent (the Proposition)     rate = 1.0
+  [PASS] code explains the sketch               code_explained_variance = 0.638
+  [FAIL] energy descent tracks accuracy         rho = -0.423
+  [FAIL] reasoning loop helps                   Dice K=1 0.3384 -> K=3 0.2204 (-0.1180)
+  -> 2 HARD CHECK(S) FAILED. The faithfulness table below is NOT interpretable.
+```
+
+The underlying checks, in order of how badly each invalidates the result:
 
 | Check | Expect | If it fails |
 |---|---|---|
@@ -159,6 +176,17 @@ In order of how badly each one invalidates the result:
 | CSI(sparse) > CSI(dense) | significant | this is the claim. The *naive* column may favour either — that is the confound, demonstrated |
 | `n_dead` atoms | small fraction | `dict_size` exceeds what the data needs; the `dict_sizes` ablation is the honest answer |
 | `collapsed_to_empty` | absent | too few epochs, or a low-label setting that needs more |
+
+**Budget.** Smoke runs (2 epochs) are plumbing checks and their numbers must
+never enter a discussion of whether the method works. ISIC needs ≈30 epochs
+before Dice approaches its 0.87–0.91 published band; BUSI and BRISC converge
+faster.
+
+**Counter-intuitive result worth knowing.** Causal necessity is *not* monotone in
+bottleneck strength. Forcing the code to explain more of the sketch (via
+`w_code_recon`) raises `code_explained_variance` from 0.44 to 0.87 and makes both
+accuracy **and** CSI worse. The knob ships off by default; see
+`docs/SPARC-Seg_v2.md` §1.8 for the measured frontier.
 
 A **null CSI result is publishable at this workshop** if the first three pass: it
 would say that constructive sparsity does not by itself buy causal faithfulness

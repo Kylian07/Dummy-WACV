@@ -269,6 +269,8 @@ def run_ablations(dataset_key: str, samples, cfg: CoreConfig, plan: ExperimentPl
         one(f"K={k}", cfg.replace(n_steps=k))
     for k in plan.topk_values:
         one(f"topk_atoms={k}", cfg.replace(topk_atoms=k))
+    one("no_code_recon_loss", cfg.replace(w_code_recon=0.0))
+    one("evidence_curriculum_on", cfg.replace(evidence_warmup_frac=0.3))
     one("no_topo (lambda2=0)", cfg.replace(lambda_topo=0.0))
     one("no_evidence_term (lambda3=0)", cfg.replace(lambda_evidence=0.0))
     # Sparsity-mechanism ablations, matched to whichever mode is in use.
@@ -385,6 +387,7 @@ def run_dataset_experiment(
             n_boot=cfg.bootstrap_n
         )
     results["main_table"] = build_main_table(results["cells"])
+    results["readiness"] = readiness_report(results)
 
     if len(concept_profiles_by_fold) > 1:
         keys = sorted(concept_profiles_by_fold)
@@ -406,6 +409,118 @@ def run_dataset_experiment(
           f"(total {human_time(results['wall_clock_seconds'])})")
     results["_last_cells"] = last_cells
     return results
+
+
+# --------------------------------------------------------------------------
+# Readiness: are the causal numbers interpretable at all?
+# --------------------------------------------------------------------------
+def readiness_report(results: Dict[str, object]) -> Dict[str, object]:
+    """Decide whether the faithfulness table means anything on this run.
+
+    This exists because a smoke run produces a complete, confident-looking
+    causal table whose numbers are pure noise, and nothing in the table itself
+    says so.  Worse, the failure is systematic rather than random: when the
+    dictionary is undertrained it compresses the sketch worse than the raw
+    evidence does, so ablating code content pushes S back toward g(x) and
+    *improves* the mask.  Necessity goes negative, CSI goes negative, and the
+    honest conclusion -- "this model is not trained yet" -- is indistinguishable
+    from "sparse states are less causally necessary than dense ones" unless
+    something checks the preconditions.
+
+    Hard checks gate the causal table. Soft checks are advisory.
+    """
+    checks: List[Dict[str, object]] = []
+
+    def add(name, ok, detail, hard=True):
+        checks.append({"check": name, "ok": bool(ok), "hard": hard, "detail": detail})
+
+    faith = results.get("faithfulness", {})
+    block_ = faith[sorted(faith)[0]] if faith else {}
+    sp = block_.get("sparcseg", {})
+    ec = sp.get("energy_coupling", {})
+    bn = sp.get("bottleneck", {})
+    curves = sp.get("curves", {})
+
+    rate = ec.get("monotone_descent_rate")
+    add("monotone descent (the Proposition)", rate is None or rate >= 0.999,
+        f"rate = {rate}", hard=True)
+
+    cev = bn.get("code_explained_variance")
+    add("code explains the sketch", cev is None or cev >= 0.30,
+        f"code_explained_variance = {cev:.3f}" if cev is not None else "n/a", hard=True)
+
+    align = ec.get("energy_gain_alignment")
+    add("energy descent tracks accuracy", align is None or not np.isfinite(align) or align > 0,
+        f"rho = {align:+.3f}" if align is not None and np.isfinite(align) else "n/a",
+        hard=True)
+
+    eff = results.get("efficiency", {})
+    if eff:
+        rows = eff[sorted(eff)[0]].get("rows", [])
+        fixed = [r for r in rows if r["mode"] == "fixed"]
+        if len(fixed) > 1:
+            d0, dk = fixed[0]["dice"], fixed[-1]["dice"]
+            add("reasoning loop helps", dk >= d0 - 1e-3,
+                f"Dice K=1 {d0:.4f} -> K={int(fixed[-1]['K'])} {dk:.4f} "
+                f"({dk - d0:+.4f})", hard=True)
+
+    main = {r["method"]: r for r in results.get("main_table", [])}
+    ours = main.get("sparcseg")
+    ref = DATASETS[results["dataset"]].reference_dice
+    if ours is not None and np.isfinite(ours.get("dice", np.nan)):
+        add("Dice in the published range", ours["dice"] >= ref[0] - 0.05,
+            f"{ours['dice']:.4f} vs literature {ref[0]:.2f}-{ref[1]:.2f} for this dataset",
+            hard=False)
+
+    cells = results.get("cells", [])
+    collapsed = [c["method"] for c in cells
+                 if c.get("test", {}).get("aggregate", {}).get("collapsed_to_empty")]
+    add("no method collapsed to empty masks", not collapsed,
+        f"collapsed: {collapsed}" if collapsed else "none", hard=True)
+
+    last_epoch = [c["method"] for c in cells
+                  if c.get("history") and
+                  c.get("best_val") is not None and
+                  c["history"][-1].get("epoch") == max(
+                      (h["epoch"] for h in c["history"]), default=-1) and
+                  c["history"][-1].get("val_dice", -1) >= (c.get("best_val", 0) - 1e-9)]
+    add("training converged (best epoch is not the last)", not last_epoch,
+        f"still improving at the final epoch: {last_epoch}" if last_epoch
+        else "converged", hard=False)
+
+    units = curves.get("n_active_units")
+    topk = results.get("config", {}).get("topk_atoms")
+    if units is not None and topk:
+        add("sparsity held", abs(units - topk) <= max(1.0, 0.25 * topk),
+            f"{units:.1f} active vs topk_atoms = {topk}", hard=False)
+
+    hard_fail = [c for c in checks if c["hard"] and not c["ok"]]
+    return {"checks": checks, "causal_interpretable": not hard_fail,
+            "n_hard_failures": len(hard_fail)}
+
+
+def print_readiness(results: Dict[str, object]) -> bool:
+    r = readiness_report(results)
+    banner("READINESS -- can these causal numbers be read?", char="=")
+    for c in r["checks"]:
+        tag = "PASS" if c["ok"] else ("FAIL" if c["hard"] else "warn")
+        kind = "" if c["hard"] else "  (advisory)"
+        print(f"  [{tag}] {c['check']:<42} {c['detail']}{kind}")
+    if r["causal_interpretable"]:
+        print("\n  -> preconditions hold; the faithfulness table below is "
+              "interpretable.")
+    else:
+        print(
+            f"\n  -> {r['n_hard_failures']} HARD CHECK(S) FAILED. The faithfulness "
+            f"table below is NOT\n"
+            f"     interpretable. On an undertrained model the causal metrics track\n"
+            f"     DICTIONARY QUALITY, not state structure: when the dictionary\n"
+            f"     compresses worse than the raw evidence does, ablating code content\n"
+            f"     pushes S back toward g(x) and IMPROVES the mask, so necessity and\n"
+            f"     CSI go negative for a reason that has nothing to do with sparsity.\n"
+            f"     Train to convergence, then re-read this table."
+        )
+    return r["causal_interpretable"]
 
 
 # --------------------------------------------------------------------------
@@ -452,6 +567,7 @@ def markdown_table(rows: Sequence[Dict], columns: Sequence[Tuple[str, str]],
 
 def print_report(results: Dict[str, object]) -> None:
     banner(f"REPORT -- {results['dataset_info']['name']}")
+    causal_ok = print_readiness(results)
 
     print("\nT1. Main results\n")
     print(markdown_table(results.get("main_table", []), [
@@ -473,7 +589,10 @@ def print_report(results: Dict[str, object]) -> None:
     if faith:
         key = sorted(faith)[0]
         block = faith[key]
-        print("\nT2. Causal faithfulness (norm-matched)\n")
+        header = ("\nT2. Causal faithfulness (norm-matched)\n" if causal_ok else
+                  "\nT2. Causal faithfulness -- *** PRECONDITIONS FAILED, NOT "
+                  "INTERPRETABLE ***\n")
+        print(header)
         rows = []
         for method in ("sparcseg", "dense_unrolled"):
             b = block.get(method)

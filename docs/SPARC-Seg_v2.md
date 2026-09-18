@@ -163,6 +163,58 @@ Added because without them a weak causal result is uninterpretable:
 - **`spatial_alignment`** — does ablating an atom change the mask *where that
   atom was active*, against a shifted-support chance baseline.
 
+### 1.8 New: the causal metrics are only readable on a trained model
+
+A first ISIC smoke run (2 epochs) produced a complete, confident-looking causal
+table that was **entirely noise** — and the noise was systematic, not random:
+CSI −0.038, transplant TTI −1.86, necessity negative, the K-sweep falling
+monotonically (0.338 → 0.242 → 0.220), and SPARC-Seg below both the dense
+control and the single-shot baseline.
+
+The mechanism matters, because it is a confound of the same family as §1.1.
+When the dictionary is undertrained it compresses the sketch **worse than the
+raw evidence does**. Ablating code content then pushes *S* back toward *g*(*x*)
+and *improves* the mask. So necessity and CSI go negative — and
+"this model is not trained yet" becomes indistinguishable from
+"sparse states are less causally necessary than dense ones" unless something
+checks the preconditions. A paper could report the second when the truth was
+the first.
+
+**Fix: a readiness gate** (`readiness_report`) with hard checks that must pass
+before the faithfulness table is interpretable — monotone descent,
+`code_explained_variance` above floor, positive energy/accuracy alignment,
+the loop not degrading with *K*, no collapse to empty masks — plus advisory
+checks for convergence and distance from published Dice. `print_report` now
+**gates T2 on these** and prints the diagnosis rather than the table.
+
+**A negative result worth reporting.** The intuitive fix — add an auxiliary loss
+making the dictionary reconstruct the sketch directly, so the code is a stronger
+bottleneck — does the opposite of what the intuition predicts. Sweeping its
+weight (6 epochs, synthetic dermoscopy-like data):
+
+| `w_code_recon` | Dice | BF@2 | code expl. var | CSI | necessity AUC |
+|---|---|---|---|---|---|
+| 0.00 | 0.8719 | 0.6289 | 0.440 | −0.0029 | −0.0053 |
+| 0.02 | 0.8670 | 0.6094 | 0.617 | −0.0046 | −0.0098 |
+| 0.05 | 0.8591 | 0.5754 | 0.750 | −0.0087 | −0.0178 |
+| 0.10 | 0.8484 | 0.5123 | 0.799 | −0.0148 | −0.0289 |
+| 0.25 | 0.8357 | 0.4524 | 0.868 | −0.0132 | −0.0352 |
+
+Forcing the code to explain more of the sketch buys exactly that, and costs
+**both** accuracy and causal structure. Causal necessity is not monotone in
+bottleneck strength — a result the paper should state, since "make the
+bottleneck tighter" is the first thing a reader will suggest. The term ships
+implemented and **off by default**; the frontier is a legitimate ablation figure.
+
+The same applies to the evidence curriculum (§1.7 lever): implemented, off by
+default, because on every regime reproducible without the real datasets the loop
+already helped, so there was no pathology for it to fix and it cost ~0.006 Dice.
+Turning it on is the documented remedy for a degrading *K*-sweep.
+
+**Practical consequence for the team.** Smoke runs are plumbing checks; their
+numbers must never enter a discussion of whether the method works. ISIC in
+particular needs ≈30 epochs before Dice approaches the 0.87–0.91 published band.
+
 ---
 
 ## 2. The problem the workshop is posing

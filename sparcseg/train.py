@@ -147,8 +147,15 @@ def train_model(
         model.param_groups(cfg.lr, cfg.lr_backbone_mult, cfg.weight_decay)
     )
     steps_per_epoch = max(len(train_loader), 1)
+    # Clamp warmup to at most a fifth of the run. With the default
+    # warmup_epochs=2, a 2-epoch smoke run spends ALL of its steps ramping the
+    # learning rate -- it starts at 1/steps of the target and never reaches the
+    # cosine decay at all (measured mean LR factor 0.53). That silently halves
+    # the effective learning rate of exactly the short runs people use to decide
+    # whether the method works.
+    warmup_epochs = min(cfg.warmup_epochs, max(1, n_epochs // 5))
     scheduler = cosine_warmup(optimizer, n_epochs * steps_per_epoch,
-                              cfg.warmup_epochs * steps_per_epoch)
+                              warmup_epochs * steps_per_epoch)
     use_amp = bool(cfg.amp and device.type == "cuda")
     try:
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -161,8 +168,19 @@ def train_model(
     criterion = SPARCSegLoss(
         alpha=cfg.dice_ce_alpha,
         deep_decay=cfg.deep_supervision_decay,
+        w_usage=getattr(cfg, "w_usage_balance", 0.01),
+        w_monotone=getattr(cfg, "w_step_monotone", 0.05),
+        w_recon=getattr(cfg, "w_code_recon", 0.10),
         deep_supervision=cfg.deep_supervision,
     )
+    dictionary = getattr(model, "dictionary", None)
+
+    # Evidence curriculum (SPARC-Seg and the dense control alike, so the two
+    # stay comparable). lambda_evidence anneals from lambda_evidence_start down
+    # to its target over the first evidence_warmup_frac of training.
+    is_loop = isinstance(model, SPARCSeg)
+    warm_ep = max(1, int(getattr(cfg, "evidence_warmup_frac", 0.0) * n_epochs))
+    lam_start = getattr(cfg, "lambda_evidence_start", cfg.lambda_evidence)
 
     best_val, best_epoch = -1.0, -1
     best_state = copy.deepcopy(model.state_dict())
@@ -170,6 +188,11 @@ def train_model(
     t0 = time.time()
 
     for epoch in range(n_epochs):
+        if is_loop and lam_start != cfg.lambda_evidence:
+            frac = min(1.0, epoch / warm_ep)
+            model.energy.w.lambda_evidence = (
+                lam_start + frac * (cfg.lambda_evidence - lam_start)
+            )
         model.train()
         loss_meter, seg_meter = AverageMeter(), AverageMeter()
         for batch in train_loader:
@@ -186,7 +209,7 @@ def train_model(
             optimizer.zero_grad(set_to_none=True)
             with autocast():
                 out = model(x, **fwd)
-                parts = criterion(out, y, pos_weight=pos_weight)
+                parts = criterion(out, y, pos_weight=pos_weight, dictionary=dictionary)
                 loss = parts["total"] + _extra_loss(model, x, y)
 
             scaler.scale(loss).backward()
@@ -207,6 +230,8 @@ def train_model(
             "epoch": epoch, "loss": loss_meter.avg, "seg": seg_meter.avg,
             "val_dice": val_dice, "val_bf2": val["aggregate"].get("bf2", float("nan")),
             "lr": optimizer.param_groups[0]["lr"],
+            "lambda_evidence": (float(model.energy.w.lambda_evidence) if is_loop
+                                else float("nan")),
         })
 
         if val_dice > best_val:
@@ -218,6 +243,10 @@ def train_model(
                   f"loss {loss_meter.avg:.4f}  val_dice {val_dice:.4f}  "
                   f"(best {best_val:.4f} @ {best_epoch})")
 
+    if is_loop:
+        # Evaluation always uses the target weight, whatever the curriculum was
+        # doing when the best checkpoint happened to be taken.
+        model.energy.w.lambda_evidence = cfg.lambda_evidence
     model.load_state_dict(best_state)
     return TrainResult(best_state, history, best_val, best_epoch, time.time() - t0)
 
@@ -272,6 +301,15 @@ def efficiency_sweep(
                  "ms_per_image": ms})
 
     fixed = [r for r in rows if r["mode"] == "fixed"]  # trained depths only
+    if len(fixed) > 1 and fixed[-1]["dice"] < fixed[0]["dice"] - 1e-3:
+        print(f"  [warn] the reasoning loop DEGRADES accuracy: Dice falls from "
+              f"{fixed[0]['dice']:.4f} at K=1 to {fixed[-1]['dice']:.4f} at "
+              f"K={int(fixed[-1]['K'])}. Almost always undertraining: the sketch "
+              f"is being routed through a dictionary that has not learned to "
+              f"reconstruct it yet. Check code_explained_variance and train "
+              f"longer before reading anything into the causal table. If it "
+              f"persists once trained, set evidence_warmup_frac=0.3 so the loop "
+              f"only takes authority as the dictionary becomes competent.")
     ad = rows[-1]
     matched = [r for r in fixed if r["dice"] >= ad["dice"] - 0.002]
     speedup = (min(r["mean_steps"] for r in matched) / max(ad["mean_steps"], 1e-6)
